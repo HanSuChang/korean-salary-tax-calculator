@@ -12,7 +12,8 @@ Practice project: Korean salary tax calculator with data validation and anomaly 
 
 ## 실행 방법
 1. Python 3.10 이상 필요
-2. tax.txt 파일이 실행 파일과 같은 폴더에 있어야 함
+2. PyCharm 다운로드
+3. tax.txt 파일이 실행 파일과 같은 폴더에 있어야 함
 
 
 python salary_calc.py
