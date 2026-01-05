@@ -1,334 +1,295 @@
+# salary_calc.py
+from __future__ import annotations
+
 import re
-from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
 
-# =========================
-# 1) tax.txt 파싱 (강력 버전)
-# =========================
-def _to_int_or_none(s: str) -> Optional[int]:
-    s = s.strip().strip('"').strip("'")
-    if s in ("-", "", "—", "–"):
+# -------------------------
+# 기본 유틸
+# -------------------------
+def round_to_10won(x: float) -> int:
+    """10원 단위로 반올림 (네이버 계산기처럼 끝자리 0에 맞추는 용도)"""
+    return int(round(x / 10.0) * 10)
+
+
+def clamp_int(x: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, x))
+
+
+def parse_int_like(s: str) -> Optional[int]:
+    """
+    '1,234' 같은 숫자를 int로.
+    '-' 또는 빈 값이면 None.
+    """
+    s = s.strip()
+    if not s or s == "-":
         return None
-    # 1,000 같은 쉼표 제거
-    s = s.replace(",", "").strip()
-    # 혹시 공백/탭 끼어있으면 정리
-    s = re.sub(r"\s+", "", s)
-    if s.isdigit():
-        return int(s)
-    return None
+    # 숫자(콤마 포함)만 추출
+    m = re.fullmatch(r"[0-9][0-9,]*", s)
+    if not m:
+        return None
+    return int(s.replace(",", ""))
 
 
+def extract_numbers_from_line(line: str) -> List[int]:
+    """
+    tax.txt 한 줄에서 숫자만 뽑기
+    예:  "1,000" , "1,005" , - , - , "1,040" ...
+    -> [1000, 1005, 1040, ...]
+    """
+    return [int(x.replace(",", "")) for x in re.findall(r"\d[\d,]*", line)]
+
+
+# -------------------------
+# tax.txt 로드 + 정리/검증
+# -------------------------
 def load_tax_table(path: str) -> pd.DataFrame:
     """
-    tax.txt 를 읽어
-    base_from, base_to, dep_1, dep_2, ... 형태의 DataFrame으로 만든다.
+    tax.txt를 읽어서 DataFrame으로 만든다.
+    가정:
+      - 각 줄의 앞 2개 숫자 = base_from, base_to (단위: 천원일 가능성 높음)
+      - 이후 숫자들 = 부양가족 수에 따른 근로소득세(간이세액)
+      - '-' 는 누락으로 보고 None 처리 (파싱 단계에서는 숫자만 뽑히므로 누락은 자동으로 빠짐)
     """
     rows: List[List[Optional[int]]] = []
 
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
+        for raw in f:
+            line = raw.strip()
             if not line:
                 continue
 
-            # 쉼표 기준 split (네 파일은 "1,000","1,005","-" ... 형태라 이게 먹힘)
-            parts = line.split(",")
-            values = [_to_int_or_none(p) for p in parts]
-
-            # 의미 있는 숫자(정수)가 너무 적으면 버림
-            if sum(v is not None for v in values) < 3:
+            # 숫자만 뽑는다 (누락 '-' 는 어차피 안 들어옴)
+            nums = extract_numbers_from_line(line)
+            if len(nums) < 2:
                 continue
 
-            rows.append(values)
+            base_from, base_to = nums[0], nums[1]
+            taxes = nums[2:]  # dep별 값들 (없을 수도 있음)
+
+            row: List[Optional[int]] = [base_from, base_to]
+            # taxes는 길이가 줄마다 다를 수 있어서, 일단 그대로 넣고 나중에 패딩
+            row.extend(taxes)
+            rows.append(row)
 
     if not rows:
-        raise ValueError("tax.txt에서 유효한 데이터 행을 읽지 못했습니다. 형식을 다시 확인하세요.")
+        raise ValueError("tax.txt에서 유효한 행을 하나도 읽지 못했습니다. 파일 형식을 확인하세요.")
 
-    # 행마다 길이가 다르면 가장 긴 길이에 맞춰 None 패딩
+    # 가장 긴 행 길이에 맞춰 패딩(None)
     max_len = max(len(r) for r in rows)
     for r in rows:
         r.extend([None] * (max_len - len(r)))
 
-    columns = ["base_from", "base_to"] + [f"dep_{i}" for i in range(1, max_len - 1)]
+    # 컬럼 생성: base_from, base_to, dep_1, dep_2, ...
+    dep_cols = [f"dep_{i}" for i in range(1, max_len - 1)]  # max_len = 2(base) + dep_n
+    columns = ["base_from", "base_to"] + dep_cols
+
     df = pd.DataFrame(rows, columns=columns)
 
-    # base_from/base_to는 꼭 있어야 하니까 필수 체크
-    df = df.dropna(subset=["base_from", "base_to"])
-    df = df.sort_values(["base_from", "base_to"]).reset_index(drop=True)
-
-    # base_from < base_to인 것만 유지 (이상행 제거)
-    df = df[df["base_from"] < df["base_to"]].reset_index(drop=True)
+    # 정렬 + 중복 제거(혹시 모를)
+    df = df.sort_values(["base_from", "base_to"]).drop_duplicates(subset=["base_from", "base_to"])
 
     return df
 
 
-# ==========================================
-# 2) 데이터 이상치(오류 가능) 검출 + 자동 보정
-# ==========================================
-@dataclass
-class FixReport:
-    negative_steps: List[Tuple[str, int]]  # (col, row_index)
-    spikes: List[Tuple[str, int]]          # (col, row_index)
-    filled_nans: List[str]
-    applied_monotonic: List[str]
-    applied_smoothing: List[str]
-
-
-def _detect_spikes(series: pd.Series, k: float = 3.5) -> pd.Index:
+def audit_and_fix_tax_table(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
     """
-    증가량(diff)에 대해 IQR 기반으로 "너무 큰 점프"를 spike로 잡는다.
-    k 클수록 덜 민감.
+    - 누락(None/NaN) 보간
+    - 세액이 내려가면(단조 위반) 누적최대로 보정
+    - 스파이크 의심(갑자기 확 튀는 변화) 로그
     """
-    diff = series.diff()
-    diff = diff.dropna()
-    if diff.empty:
-        return pd.Index([])
+    fixed = df.copy()
 
-    q1 = diff.quantile(0.25)
-    q3 = diff.quantile(0.75)
-    iqr = q3 - q1
-    if iqr == 0:
-        # diff가 거의 일정한 케이스는 spike 판단이 애매하므로 빈 목록
-        return pd.Index([])
+    dep_cols = [c for c in fixed.columns if c.startswith("dep_")]
 
-    upper = q3 + k * iqr
-    spike_idx = diff[diff > upper].index
-    return spike_idx
-
-
-def clean_and_fix_tax_table(df: pd.DataFrame) -> Tuple[pd.DataFrame, FixReport]:
-    """
-    - dep_* 컬럼별로
-      1) 결측(None/NaN) 보간
-      2) 세금이 줄어드는 구간(음수 diff) 방지: 누적최대(cummax)로 단조증가 강제
-      3) 너무 큰 점프(spike) 구간 완화: 주변값으로 선형 보간
-    """
-    df = df.copy()
-    dep_cols = [c for c in df.columns if c.startswith("dep_")]
-
-    report = FixReport(
-        negative_steps=[],
-        spikes=[],
-        filled_nans=[],
-        applied_monotonic=[],
-        applied_smoothing=[]
-    )
-
-    # 2-1) 숫자형으로 변환
+    # 누락 보간: 앞/뒤 채움
+    # (FutureWarning 피하려고 fillna(method=...) 대신 ffill/bfill 사용)
     for c in dep_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+        fixed[c] = fixed[c].ffill().bfill()
 
-    # 2-2) 결측치 처리: 선형보간 + 앞뒤 채움
+    # 단조 증가 위반 보정 (월급이 커지면 세액이 보통 증가/유지여야 함)
+    # cummax로 "내려가는 구간"을 자동 복구
     for c in dep_cols:
-        before_na = df[c].isna().sum()
-        if before_na > 0:
-            df[c] = df[c].interpolate(method="linear", limit_direction="both")
-            df[c] = df[c].fillna(method="ffill").fillna(method="bfill")
-            after_na = df[c].isna().sum()
-            if after_na == 0:
-                report.filled_nans.append(c)
+        s = fixed[c]
+        if s.isna().all():
+            continue
 
-    # 2-3) spike 완화: spike 인덱스를 NaN으로 만든 뒤 보간
-    for c in dep_cols:
-        spike_idx = _detect_spikes(df[c], k=3.5)
-        if len(spike_idx) > 0:
-            for idx in spike_idx:
-                report.spikes.append((c, int(idx)))
-            df.loc[spike_idx, c] = pd.NA
-            df[c] = df[c].interpolate(method="linear", limit_direction="both")
-            df[c] = df[c].fillna(method="ffill").fillna(method="bfill")
-            report.applied_smoothing.append(c)
+        # 단조 위반 개수 체크
+        diff = s.diff()
+        drops = (diff < 0).sum()
+        if verbose and drops > 0:
+            print(f"[검출] 세액 감소(단조 위반) {drops}건 발견 -> {c} 누적최대(cummax)로 보정")
 
-    # 2-4) 단조증가 강제 (세금이 줄어드는 구간 제거)
-    for c in dep_cols:
-        diff = df[c].diff()
-        neg_idx = df.index[diff < 0]
-        if len(neg_idx) > 0:
-            for idx in neg_idx:
-                report.negative_steps.append((c, int(idx)))
-            df[c] = df[c].cummax()
-            report.applied_monotonic.append(c)
+        fixed[c] = fixed[c].cummax()
 
-    # 소수점이면 반올림 (세금은 보통 원 단위)
-    for c in dep_cols:
-        df[c] = df[c].round().astype(int)
+    # 스파이크(급격한 증가) 의심: 변화량이 중앙값 대비 너무 큰 경우
+    # (그냥 ‘의심’ 로그만 띄움)
+    if verbose:
+        for c in dep_cols:
+            s = fixed[c].astype(float)
+            d = s.diff().abs()
+            med = d.median()
+            if med == 0 or pd.isna(med):
+                continue
+            # 중앙값의 20배 이상이면 스파이크 후보
+            spike_idx = fixed.index[d > (20 * med)].tolist()
+            if spike_idx:
+                # 너무 많으면 앞부분만 보여주기
+                show = spike_idx[:10]
+                for idx in show:
+                    print(f"[의심] spike: {c}, 행 index={idx}")
+                if len(spike_idx) > 10:
+                    print(f"       ... (나머지 {len(spike_idx)-10}건 생략)")
 
-    return df, report
+    return fixed
 
 
-def print_fix_report(report: FixReport) -> None:
-    print("\n===== [데이터 품질 검사/보정 리포트] =====")
-
-    if report.filled_nans:
-        print(f"- 결측치 보간 완료 컬럼: {', '.join(report.filled_nans)}")
-    else:
-        print("- 결측치 보간: 특별한 변경 없음")
-
-    if report.spikes:
-        print(f"- 급격 점프(spike) 의심 {len(report.spikes)}건 발견 (일부 완화 보간 적용)")
-        # 너무 길어질 수 있으니 앞 10개만 보여줌
-        for c, idx in report.spikes[:10]:
-            print(f"  • spike 의심: {c}, 행 index={idx}")
-        if len(report.spikes) > 10:
-            print(f"  ... (나머지 {len(report.spikes)-10}건 생략)")
-    else:
-        print("- 급격 점프(spike): 발견 없음")
-
-    if report.negative_steps:
-        print(f"- 세금 감소(단조성 위반) {len(report.negative_steps)}건 발견 → 누적최대(cummax)로 보정")
-        for c, idx in report.negative_steps[:10]:
-            print(f"  • 감소 발견: {c}, 행 index={idx}")
-        if len(report.negative_steps) > 10:
-            print(f"  ... (나머지 {len(report.negative_steps)-10}건 생략)")
-    else:
-        print("- 세금 감소(단조성 위반): 발견 없음")
-
-    if report.applied_smoothing:
-        print(f"- spike 완화 보간 적용 컬럼: {', '.join(report.applied_smoothing)}")
-    if report.applied_monotonic:
-        print(f"- 단조증가 강제 적용 컬럼: {', '.join(report.applied_monotonic)}")
-
-    print("========================================\n")
-
-
-# ==========================================
-# 3) 세금 조회 (월 과세표준 -> 간이세액)
-# ==========================================
-def get_income_tax_monthly(df: pd.DataFrame, taxable_monthly: int, dependents: int) -> int:
+def find_income_tax_monthly(df: pd.DataFrame, taxable_monthly_won: int, dependents: int) -> int:
     """
-    df: 정리된 tax 테이블
-    taxable_monthly: 월 과세표준(원)
-    dependents: 부양가족 수(본인 포함) (1 이상)
+    간이세액표에서 월 소득세(근로소득세) 찾기
+    - taxable_monthly_won을 '천원 단위'로 변환해 base 구간 찾음
+    - dependents에 해당하는 dep_k 컬럼 사용
     """
-    if dependents < 1:
-        dependents = 1
-
     dep_cols = [c for c in df.columns if c.startswith("dep_")]
     if not dep_cols:
-        raise ValueError("tax 테이블에서 dep_* 컬럼을 찾지 못했습니다.")
+        # 표에 dep 컬럼이 없으면 세액 계산 불가
+        return 0
 
-    # dep 컬럼 범위를 넘으면 마지막 컬럼 사용
-    dep_idx = min(dependents, len(dep_cols))
-    col = f"dep_{dep_idx}"
+    # dependents 최소 1(본인 포함)
+    dependents = max(1, dependents)
 
-    # 구간 찾기: base_from <= x <= base_to
-    mask = (df["base_from"] <= taxable_monthly) & (taxable_monthly <= df["base_to"])
-    hit = df[mask]
+    # 표의 dep 컬럼 범위 넘어가면 마지막 컬럼 사용
+    dep_col = f"dep_{dependents}"
+    if dep_col not in df.columns:
+        dep_col = dep_cols[-1]
 
+    # 천원 단위로 변환 (표가 1,000 ~ 1,005 이런 식이라 보통 천원 단위)
+    x = taxable_monthly_won // 1000
+
+    # 구간 매칭: base_from <= x < base_to
+    hit = df[(df["base_from"] <= x) & (x < df["base_to"])]
     if hit.empty:
-        # 과세표준이 너무 큰 경우 마지막 행 사용
-        # 너무 작은 경우 첫 행 사용
-        if taxable_monthly < int(df["base_from"].iloc[0]):
-            return int(df[col].iloc[0])
-        return int(df[col].iloc[-1])
+        # 범위 밖이면 가장 끝 구간으로 클램프
+        if x < int(df["base_from"].min()):
+            row = df.sort_values("base_from").iloc[0]
+        else:
+            row = df.sort_values("base_to").iloc[-1]
+    else:
+        row = hit.iloc[0]
 
-    return int(hit[col].iloc[0])
-
-
-# ==========================================
-# 4) 4대보험 + 지방소득세 계산 (간단 모델)
-# ==========================================
-def calc_salary(annual_salary: int, non_taxable_annual: int, dependents: int, tax_df: pd.DataFrame) -> Dict[str, int]:
-    """
-    annual_salary: 연봉(원)
-    non_taxable_annual: 연 비과세(원) (예: 식대 비과세, 차량유지비 비과세 등 합)
-    dependents: 부양가족 수(본인 포함)
-    """
-    if annual_salary < 0:
-        raise ValueError("연봉은 0 이상이어야 합니다.")
-    if non_taxable_annual < 0:
-        non_taxable_annual = 0
-    if non_taxable_annual > annual_salary:
-        non_taxable_annual = annual_salary
-
-    # 월 급여(단순: 연봉/12)
-    gross_monthly = annual_salary / 12
-
-    # 월 비과세
-    non_taxable_monthly = non_taxable_annual / 12
-
-    # 월 과세표준(간단 모델: 월급 - 월비과세)
-    taxable_monthly = max(0, int(round(gross_monthly - non_taxable_monthly)))
-
-    # 4대보험(요청 이미지 스타일에 맞춘 비율 사용)
-    국민연금 = int(round(gross_monthly * 0.0475))
-    건강보험 = int(round(gross_monthly * 0.03595))
-    요양보험 = int(round(건강보험 * 0.1314))   # 건강보험료의 13.14%
-    고용보험 = int(round(gross_monthly * 0.009))
-
-    # 근로소득세(간이세액) = tax.txt 기반
-    근로소득세 = get_income_tax_monthly(tax_df, taxable_monthly, dependents)
-
-    # 지방소득세 = 근로소득세의 10%
-    지방소득세 = int(round(근로소득세 * 0.10))
-
-    total_deduction = 국민연금 + 건강보험 + 요양보험 + 고용보험 + 근로소득세 + 지방소득세
-
-    net_monthly = int(round(gross_monthly - total_deduction))
-    net_annual = net_monthly * 12
-
-    return {
-        "국민연금(4.75%)": 국민연금,
-        "건강보험(3.595%)": 건강보험,
-        "요양보험(13.14%)": 요양보험,
-        "고용보험(0.9%)": 고용보험,
-        "근로소득세(간이세액)": 근로소득세,
-        "지방소득세(10%)": 지방소득세,
-        "년 예상 실수령액": net_annual,
-        "월 환산금액": net_monthly,
-        "월 과세표준": taxable_monthly,
-    }
+    val = row[dep_col]
+    if pd.isna(val):
+        return 0
+    return int(val)
 
 
-def print_like_naver(result: Dict[str, int]) -> None:
-    # 출력 포맷을 이미지 느낌으로
-    order = [
-        "국민연금(4.75%)",
-        "건강보험(3.595%)",
-        "요양보험(13.14%)",
-        "고용보험(0.9%)",
-        "근로소득세(간이세액)",
-        "지방소득세(10%)",
-        "년 예상 실수령액",
-        "월 환산금액",
-    ]
+# -------------------------
+# 결과 계산
+# -------------------------
+@dataclass
+class SalaryResult:
+    pension: int
+    health: int
+    long_term_care: int
+    employment: int
+    income_tax: int
+    local_tax: int
+    annual_take_home: int
+    monthly_take_home: int
 
+
+def calc_salary(
+    annual_salary: int,
+    non_taxable_annual: int,
+    dependents: int,
+    tax_df: pd.DataFrame,
+) -> SalaryResult:
+    # 입력 정리
+    annual_salary = max(0, int(annual_salary))
+    non_taxable_annual = max(0, int(non_taxable_annual))
+    dependents = max(1, int(dependents))
+
+    # 비과세가 연봉보다 크면 말이 안 되니 자동으로 연봉까지 제한
+    non_taxable_annual = min(non_taxable_annual, annual_salary)
+
+    taxable_annual = annual_salary - non_taxable_annual
+    taxable_monthly = taxable_annual / 12.0  # float
+    taxable_monthly_won = int(round(taxable_monthly))
+
+    # (실습용) 네이버 스샷에 맞춘 비율
+    PENSION_RATE = 0.0475
+    HEALTH_RATE = 0.03595
+    LTC_RATE = 0.1314
+    EMP_RATE = 0.009
+
+    pension = round_to_10won(taxable_monthly * PENSION_RATE)
+    health = round_to_10won(taxable_monthly * HEALTH_RATE)
+    long_term = round_to_10won(health * LTC_RATE)
+    employment = round_to_10won(taxable_monthly * EMP_RATE)
+
+    # 근로소득세(간이세액표)
+    income_tax = find_income_tax_monthly(tax_df, taxable_monthly_won, dependents)
+    # 지방소득세 10%
+    local_tax = round_to_10won(income_tax * 0.10)
+
+    monthly_take_home = int(round(taxable_monthly)) - (pension + health + long_term + employment + income_tax + local_tax)
+    annual_take_home = monthly_take_home * 12
+
+    return SalaryResult(
+        pension=pension,
+        health=health,
+        long_term_care=long_term,
+        employment=employment,
+        income_tax=income_tax,
+        local_tax=local_tax,
+        annual_take_home=annual_take_home,
+        monthly_take_home=monthly_take_home,
+    )
+
+
+def print_like_naver(r: SalaryResult) -> None:
     print()
-    for k in order:
-        v = result[k]
-        print(f"{k:<18} {v:>12,} 원")
-    print()
+    print(f"국민연금(4.75%)        {r.pension:>10,} 원")
+    print(f"건강보험(3.595%)       {r.health:>10,} 원")
+    print(f"요양보험(13.14%)       {r.long_term_care:>10,} 원")
+    print(f"고용보험(0.9%)         {r.employment:>10,} 원")
+    print(f"근로소득세(간이세액)    {r.income_tax:>10,} 원")
+    print(f"지방소득세(10%)         {r.local_tax:>10,} 원")
+    print(f"년 예상 실수령액        {r.annual_take_home:>10,} 원")
+    print(f"월 환산금액            {r.monthly_take_home:>10,} 원")
 
 
-# ==========================================
-# 5) 실행부
-# ==========================================
+# -------------------------
+# 실행부
+# -------------------------
 if __name__ == "__main__":
-    # tax.txt 는 이 파일과 같은 폴더에 있어야 함
+    # ✅ tax.txt는 이 파일(salary_calc.py)과 "같은 폴더"에 있어야 함
     base_dir = Path(__file__).resolve().parent
     tax_path = base_dir / "tax.txt"
 
     if not tax_path.exists():
         raise FileNotFoundError(f"tax.txt를 찾을 수 없습니다: {tax_path}")
 
-    raw_df = load_tax_table(str(tax_path))
-    fixed_df, rep = clean_and_fix_tax_table(raw_df)
+    # 1) 세액표 로드
+    df = load_tax_table(str(tax_path))
 
-    # 보정 리포트 출력(뭐가 이상했는지 보여줌)
-    print_fix_report(rep)
+    # 2) 이상치 검출 + 자동 보정
+    df = audit_and_fix_tax_table(df, verbose=True)
 
-    # 입력 (엔터치면 기본값 사용)
+    # 3) 입력(모르면 엔터 -> 기본값)
     try:
-        annual_salary = int(input("연봉(원) 입력 [예: 36000000] : ").strip() or "36000000")
-        non_taxable_annual = int(input("비과세(연, 원) 입력 [예: 2400000] : ").strip() or "2400000")
-        dependents = int(input("부양가족수(본인포함) 입력 [예: 1] : ").strip() or "1")
+        annual_salary = int((input("연봉(원) 입력 [예: 36000000] : ").strip() or "36000000"))
+        non_taxable_annual = int((input("비과세액(연, 원) 입력 [모르면 0] : ").strip() or "0"))
+        dependents = int((input("부양가족수(본인포함) 입력 [모르면 1] : ").strip() or "1"))
     except ValueError:
         print("숫자로만 입력해야 합니다.")
         raise
 
-    result = calc_salary(annual_salary, non_taxable_annual, dependents, fixed_df)
+    # 4) 계산 + 출력
+    result = calc_salary(annual_salary, non_taxable_annual, dependents, df)
     print_like_naver(result)
